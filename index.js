@@ -5,7 +5,9 @@
  * @module
  */
 /**
- * Curve params. secp256k1 is short weierstrass / koblitz curve. Equation is y² == x³ + ax + b.
+ * Curve params from SEC 2 v2 §2.4.1.
+ * secp256k1 is a short Weierstrass / Koblitz curve with equation
+ * `y² == x³ + ax + b`.
  * * P = `2n**256n - 2n**32n - 977n` // field over which calculations are done
  * * N = `2n**256n - 0x14551231950b75fc4402da1732fc9bebfn` // group order, amount of curve points
  * * h = `1n` // cofactor
@@ -13,7 +15,9 @@
  * * b = `7n` // equation param
  * * Gx, Gy are coordinates of Generator / base point
  */
-const secp256k1_CURVE = {
+// Mirror noble-curves: Point.CURVE() returns shared params, but those params must stay frozen so
+// callers cannot mutate them out from under the arithmetic constants captured below.
+const secp256k1_CURVE = Object.freeze({
     p: 0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2fn,
     n: 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n,
     h: 1n,
@@ -21,34 +25,38 @@ const secp256k1_CURVE = {
     b: 7n,
     Gx: 0x79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798n,
     Gy: 0x483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8n,
-};
+});
 const { p: P, n: N, Gx, Gy, b: _b } = secp256k1_CURVE;
-const L = 32; // field / group byte length
-const L2 = 64;
+// 32-byte field / scalar width, and the SHA-256 / HMAC-DRBG output width used
+// by the RFC6979 paths here.
+const L = 32;
+const L2 = 64; // 64-byte compact signatures, and 64 hex chars for zero-padded 32-byte scalars
 const lengths = {
     publicKey: L + 1,
     publicKeyUncompressed: L2 + 1,
     signature: L2,
+    // 48-byte keygen seed floor: 384 bits exceeds FIPS 186-5 Table A.2's
+    // 352-bit recommendation for 256-bit prime curves.
     seed: L + L / 2,
 };
 // Helpers and Precomputes sections are reused between libraries
 // ## Helpers
 // ----------
-// @ts-ignore
-const captureTrace = (...args) => {
-    if ('captureStackTrace' in Error && typeof Error.captureStackTrace === 'function') {
-        Error.captureStackTrace(...args);
-    }
-};
-const err = (message = '') => {
-    const e = new Error(message);
-    captureTrace(e, err);
+const err = (message = '', E = Error) => {
+    const e = new E(message);
+    const { captureStackTrace } = Error;
+    if (typeof captureStackTrace === 'function')
+        captureStackTrace(e, err);
     throw e;
 };
-const isBig = (n) => typeof n === 'bigint'; // is big integer
-const isStr = (s) => typeof s === 'string'; // is string
-const isBytes = (a) => a instanceof Uint8Array || (ArrayBuffer.isView(a) && a.constructor.name === 'Uint8Array');
-/** Asserts something is Uint8Array. */
+// Plain `instanceof Uint8Array` is too strict for some Buffer / proxy / cross-realm cases. The
+// fallback still requires a real ArrayBuffer view so plain JSON-deserialized `{ constructor: ... }`
+// spoofing is rejected, and `BYTES_PER_ELEMENT === 1` keeps the fallback on byte-oriented views.
+const isBytes = (a) => a instanceof Uint8Array ||
+    (ArrayBuffer.isView(a) &&
+        a.constructor.name === 'Uint8Array' &&
+        a.BYTES_PER_ELEMENT === 1);
+/** Asserts something is Bytes. */
 const abytes = (value, length, title = '') => {
     const bytes = isBytes(value);
     const len = value?.length;
@@ -58,29 +66,31 @@ const abytes = (value, length, title = '') => {
         const ofLen = needsLen ? ` of length ${length}` : '';
         const got = bytes ? `length=${len}` : `type=${typeof value}`;
         const msg = prefix + 'expected Uint8Array' + ofLen + ', got ' + got;
-        throw bytes ? new RangeError(msg) : new TypeError(msg);
+        return bytes ? err(msg, RangeError) : err(msg, TypeError);
     }
     return value;
 };
 /** create Uint8Array */
 const u8n = (len) => new Uint8Array(len);
+// Callers keep values non-negative and within the requested width; padStart() won't truncate over-wide inputs.
 const padh = (n, pad) => n.toString(16).padStart(pad, '0');
-const bytesToHex = (b) => Array.from(abytes(b))
-    .map((e) => padh(e, 2))
-    .join('');
-const C = { _0: 48, _9: 57, A: 65, F: 70, a: 97, f: 102 }; // ASCII characters
-const _ch = (ch) => {
-    if (ch >= C._0 && ch <= C._9)
-        return ch - C._0; // '2' => 50-48
-    if (ch >= C.A && ch <= C.F)
-        return ch - (C.A - 10); // 'B' => 66-(65-10)
-    if (ch >= C.a && ch <= C.f)
-        return ch - (C.a - 10); // 'b' => 98-(97-10)
-    return;
+/** Render bytes as lowercase hex. */
+const bytesToHex = (b) => {
+    let hex = '';
+    for (const e of abytes(b))
+        hex += padh(e, 2);
+    return hex;
 };
+const C = { _0: 48, _9: 57, A: 65, F: 70, a: 97, f: 102 }; // ASCII characters
+// Strict ASCII nibble parser: non-ASCII hex lookalikes are rejected as undefined.
+// prettier-ignore
+const _ch = (ch) => ch >= C._0 && ch <= C._9 ? ch - C._0 // '2' => 50-48
+    : ch >= C.A && ch <= C.F ? ch - (C.A - 10) // 'B' => 66-(65-10)
+        : ch >= C.a && ch <= C.f ? ch - (C.a - 10) // 'b' => 98-(97-10)
+            : undefined;
 const hexToBytes = (hex) => {
-    const e = 'hex invalid';
-    if (!isStr(hex))
+    const e = 'hex invalid'; // Strict ASCII hex only, with one generic error for type and parse failures.
+    if (typeof hex !== 'string')
         return err(e);
     const hl = hex.length;
     const al = hl / 2;
@@ -97,29 +107,33 @@ const hexToBytes = (hex) => {
     }
     return array;
 };
-const cr = () => globalThis?.crypto; // WebCrypto is available in all modern environments
-const subtle = () => cr()?.subtle ?? err('crypto.subtle must be defined, consider polyfill');
+// WebCrypto is available in all modern environments
+const subtle = () => globalThis?.crypto?.subtle ?? err('crypto.subtle must be defined, consider polyfill');
 // prettier-ignore
 const concatBytes = (...arrs) => {
-    const r = u8n(arrs.reduce((sum, a) => sum + abytes(a).length, 0)); // create u8a of summed length
+    let len = 0;
+    for (const a of arrs)
+        len += abytes(a).length; // validate every input and sum lengths before copying
+    const r = u8n(len);
     let pad = 0; // walk through each array,
-    arrs.forEach(a => { r.set(a, pad); pad += a.length; }); // ensure they have proper type
+    for (const a of arrs)
+        r.set(a, pad), pad += a.length; // ensure they have proper type
     return r;
 };
-/** WebCrypto OS-level CSPRNG (random number generator). Will throw when not available. */
-const randomBytes = (len = L) => {
-    const c = cr();
-    return c.getRandomValues(u8n(len));
-};
+/**
+ * WebCrypto OS-level CSPRNG (random number generator).
+ * Will throw when not available; large-request ceilings are delegated to getRandomValues().
+ */
+const randomBytes = (len = L) => (globalThis?.crypto).getRandomValues(u8n(len));
 const big = BigInt;
 const arange = (n, min, max, msg = 'bad number: out of range') => {
-    if (!isBig(n))
-        throw new TypeError(msg);
+    if (typeof n !== 'bigint')
+        return err(msg, TypeError);
     if (min <= n && n < max)
         return n;
-    throw new RangeError(msg);
+    return err(msg, RangeError);
 };
-/** modular division */
+/** Canonical modular reduction. Callers must provide a positive modulus. */
 const M = (a, b = P) => {
     const r = a % b;
     return r >= 0n ? r : b + r;
@@ -145,6 +159,10 @@ const callHash = (name) => {
         err('hashes.' + name + ' not set');
     return fn;
 };
+// All exported provider slots are caller-configurable and may be unset or return arbitrary values,
+// so wrapper helpers must enforce the exact 32-byte digest contract instead of trusting providers.
+const gh = (name, a, b) => abytes(callHash(name)(a, b), L, 'digest');
+const gha = (name, a, b) => Promise.resolve(callHash(name)(a, b)).then((r) => abytes(r, L, 'digest'));
 /**
  * SHA-256 helper used by the synchronous API.
  * @param msg - message bytes to hash
@@ -158,28 +176,37 @@ const callHash = (name) => {
  * const digest = secp.hash(new Uint8Array([1, 2, 3]));
  * ```
  */
-const hash = (msg) => callHash('sha256')(msg);
+// Public helper validates the message boundary explicitly; the configured provider is still looked
+// up dynamically and its output is checked with `gh(...)`.
+const hash = (msg) => gh('sha256', abytes(msg, undefined, 'message'));
+// also rejects structurally similar Point values from other realms / bundled copies
 const apoint = (p) => (p instanceof Point ? p : err('Point expected'));
 // ## End of Helpers
 // -----------------
-/** secp256k1 formula. Koblitz curves are subclass of weierstrass curves with a=0, making it x³+b */
+/**
+ * secp256k1 formula. Koblitz curves are subclass of weierstrass curves with a=0,
+ * making it x³+b; callers validate x first.
+ */
 const koblitz = (x) => M(M(x * x) * x + _b);
-/** assert is element of field mod P (incl. 0) */
+/** assert is element of field mod P (incl. 0 for projective infinity coordinates) */
 const FpIsValid = (n) => arange(n, 0n, P);
-/** assert is element of field mod P (excl. 0) */
+/** assert is element of field mod P (excl. 0 where current callers need a non-zero coordinate) */
 const FpIsValidNot0 = (n) => arange(n, 1n, P);
-/** assert is element of field mod N (excl. 0) */
+/** assert is element of field mod N (excl. 0), matching the shared BIP340 scalar-failure rule used here */
 const FnIsValidNot0 = (n) => arange(n, 1n, N);
-const isEven = (y) => (y & 1n) === 0n;
+// Shared parity primitive for BIP340 even-y checks and SEC 1 compressed prefixes.
+const isEven = (y) => !(y & 1n);
 /** create Uint8Array of byte n */
 const u8of = (n) => Uint8Array.of(n);
+/** SEC 1 compressed-prefix helper. Parity only: callers validate y before asking for the prefix byte. */
 const getPrefix = (y) => u8of(isEven(y) ? 0x02 : 0x03);
-/** lift_x from BIP340 calculates square root. Validates x, then validates root*root. */
+/** lift_x from BIP340 returns the unique even square root for x³+7.
+ * SEC 1 callers still flip it for the odd-prefix branch. */
 const lift_x = (x) => {
     // Let c = x³ + 7 mod p. Fail if x ≥ p. (also fail if x < 1)
     const c = koblitz(FpIsValidNot0(x));
-    // c = √y
-    // y = c^((p+1)/4) mod p
+    // r = √c candidate
+    // r = c^((p+1)/4) mod p
     // This formula works for fields p = 3 mod 4 -- a special, fast case.
     // Paper: "Square Roots from 1;24,51,10 to Dan Shanks".
     let r = 1n;
@@ -189,8 +216,15 @@ const lift_x = (x) => {
             r = (r * num) % P; // Uses exponentiation by squaring.
         num = (num * num) % P; // Not constant-time.
     }
-    return M(r * r) === c ? r : err('sqrt invalid'); // check if result is valid
+    if (M(r * r) !== c)
+        err('sqrt invalid'); // check if result is valid
+    return isEven(r) ? r : M(-r);
 };
+export const __TEST = /* @__PURE__ */ Object.freeze({
+    // Shared tests expect the BIP340 helper to expose the canonical even-y point, not just the root.
+    lift_x: (x) => Point.fromAffine({ x, y: lift_x(x) }),
+    extractK: (rand) => extractK(rand),
+});
 /**
  * Point in 3d xyz projective coordinates. 3d takes less inversions than 2d.
  * @param X - X coordinate.
@@ -215,6 +249,9 @@ class Point {
         this.Z = FpIsValid(Z);
         Object.freeze(this);
     }
+    /** Returns the shared curve metadata object by reference.
+     * It is readonly only at type level, and mutating it won't retarget arithmetic,
+     * which already uses module-load snapshots. */
     static CURVE() {
         return secp256k1_CURVE;
     }
@@ -232,14 +269,16 @@ class Point {
         const head = bytes[0];
         const tail = bytes.subarray(1);
         const x = sliceBytesNumBE(tail, 0, L);
-        // No actual validation is done here: use .assertValidity()
+        // SEC 1 defines the rare infinity encoding 0x00, but SEC 1 public-key validation rejects
+        // infinity. We keep 0x00 rejected here because this parser is reused by verify(), ECDH,
+        // and public-key validation helpers, so strict handling applies to all callers by default.
+        // Local secp256k1 crosstests show OpenSSL raw point codecs accept 0x00 too.
+        // Parse SEC 1 compressed/uncompressed encodings, then finish with assertValidity() before returning.
         if (length === comp && (head === 0x02 || head === 0x03)) {
             // Equation is y² == x³ + ax + b. We calculate y from x.
-            // y = √y²; there are two solutions: y, -y. Determine proper solution based on prefix
+            // lift_x() returns the even root; SEC 1 0x03 still needs the odd root.
             let y = lift_x(x);
-            const evenY = isEven(y);
-            const evenH = isEven(big(head));
-            if (evenH !== evenY)
+            if (head === 0x03)
                 y = M(-y);
             p = new Point(x, y, 1n);
         }
@@ -337,11 +376,12 @@ class Point {
     /**
      * Point-by-scalar multiplication. Scalar must be in range 1 <= n < CURVE.n.
      * Uses {@link wNAF} for base point.
-     * Uses fake point to mitigate side-channel leakage.
+     * Uses fake point to mitigate leakage shape in JS, not as a hard constant-time guarantee.
      * @param n scalar by which point is multiplied
      * @param safe safe mode guards against timing attacks; unsafe mode is faster
      */
     multiply(n, safe = true) {
+        // Unsafe internal callers may legitimately need 0*P = O during double-scalar multiplication.
         if (!safe && n === 0n)
             return I;
         FnIsValidNot0(n);
@@ -390,6 +430,8 @@ class Point {
     }
     /** Converts point to 33/65-byte Uint8Array. */
     toBytes(isCompressed = true) {
+        // Same policy as fromBytes(): SEC 1 has the rare infinity encoding 0x00, but we keep ZERO
+        // out of this byte surface because callers treat these encodings as public keys by default.
         const { x, y } = this.assertValidity().toAffine();
         const x32b = numTo32b(x);
         if (isCompressed)
@@ -409,25 +451,29 @@ Point.BASE = G;
 Point.ZERO = I;
 /** `Q = u1⋅G + u2⋅R`. Verifies Q is not ZERO. Unsafe: non-CT. */
 const doubleScalarMulUns = (R, u1, u2) => {
-    return G.multiply(u1, false).add(R.multiply(u2, false)).assertValidity();
+    return G.multiply(u1, false)
+        .add(R.multiply(u2, false))
+        .assertValidity();
 };
+// Inherits byte validation from bytesToHex(); the || '0' fallback keeps empty input mapped to 0n.
 const bytesToNumBE = (b) => big('0x' + (bytesToHex(b) || '0'));
+// Callers provide monotone slice bounds; subarray() would otherwise clamp or reinterpret them silently.
 const sliceBytesNumBE = (b, from, to) => bytesToNumBE(b.subarray(from, to));
 const B256 = 2n ** 256n; // secp256k1 is weierstrass curve. Equation is x³ + ax + b.
-/** Number to 32b. Must be 0 <= num < B256. validate, pad, to bytes. */
+/** Generic 32-byte big-endian encoder. Must be 0 <= num < B256; call sites need not be field/scalar elements. */
 const numTo32b = (num) => hexToBytes(padh(arange(num, 0n, B256), L2));
-/** Normalize private key to scalar (bigint). Verifies scalar is in range 1<s<N */
+/** Normalize private key to scalar (bigint). Verifies scalar is in range 1 <= d < N. */
 const secretKeyToScalar = (secretKey) => {
     const num = bytesToNumBE(abytes(secretKey, L, 'secret key'));
     return arange(num, 1n, N, 'invalid secret key: outside of range');
 };
-/** For Signature malleability, validates sig.s is bigger than N/2. */
+/** For signature malleability, checks the strict upper-half predicate s > floor(N/2). */
 const highS = (n) => n > N >> 1n;
 /**
- * Creates 33/65-byte public key from 32-byte private key.
+ * Creates a SEC 1 public key from a 32-byte private key.
  * @param privKey - 32-byte secret key.
- * @param isCompressed - return 33-byte compressed key when `true`.
- * @returns serialized secp256k1 public key.
+ * @param isCompressed - return 33-byte compressed SEC 1 encoding when `true`, otherwise 65-byte uncompressed.
+ * @returns serialized secp256k1 public key in SEC 1 encoding.
  * @example
  * Derive the serialized public key for a secp256k1 secret key.
  * ```ts
@@ -461,25 +507,18 @@ const isValidPublicKey = (publicKey, isCompressed) => {
         return false;
     }
 };
-const assertRecoveryBit = (recovery) => {
-    if (![0, 1, 2, 3].includes(recovery))
-        err('recovery id must be valid and present');
-};
+const assertRecoveryBit = (recovery) => [0, 1, 2, 3].includes(recovery) ? recovery : err('invalid recovery id');
 const assertSigFormat = (format) => {
-    if (format != null && !ALL_SIG.includes(format))
-        err(`Signature format must be one of: ${ALL_SIG.join(', ')}`);
     if (format === SIG_DER)
         err('Signature format "der" is not supported: switch to noble-curves');
+    if (format != null && format !== SIG_COMPACT && format !== SIG_RECOVERED)
+        err('Signature format must be one of: compact, recovered, der');
 };
 const assertSigLength = (sig, format = SIG_COMPACT) => {
     assertSigFormat(format);
-    const SL = lengths.signature;
-    const RL = SL + 1;
-    let msg = `Signature format "${format}" expects Uint8Array with length `;
-    if (format === SIG_COMPACT && sig.length !== SL)
-        err(msg + SL);
-    if (format === SIG_RECOVERED && sig.length !== RL)
-        err(msg + RL);
+    const len = lengths.signature + Number(format === SIG_RECOVERED);
+    if (sig.length !== len)
+        err(`Signature format "${format}" expects Uint8Array with length ${len}`);
 };
 /**
  * ECDSA Signature class. Supports only compact 64-byte representation, not DER.
@@ -500,8 +539,9 @@ class Signature {
     constructor(r, s, recovery) {
         this.r = FnIsValidNot0(r); // 1 <= r < N
         this.s = FnIsValidNot0(s); // 1 <= s < N
+        // Keep recovered Signature objects internally consistent across all construction paths.
         if (recovery != null)
-            this.recovery = recovery;
+            this.recovery = assertRecoveryBit(recovery);
         Object.freeze(this);
     }
     static fromBytes(b, format = SIG_COMPACT) {
@@ -522,25 +562,28 @@ class Signature {
         return highS(this.s);
     }
     toBytes(format = SIG_COMPACT) {
+        // Standalone noble-secp256k1 does not implement DER; reject here so direct Signature users
+        // don't silently get compact bytes for an unsupported format.
+        assertSigFormat(format);
         const { r, s, recovery } = this;
         const res = concatBytes(numTo32b(r), numTo32b(s));
         if (format === SIG_RECOVERED) {
-            assertRecoveryBit(recovery);
-            return concatBytes(Uint8Array.of(recovery), res);
+            return concatBytes(u8of(assertRecoveryBit(recovery)), res);
         }
         return res;
     }
 }
 /**
  * RFC6979: ensure ECDSA msg is X bytes, convert to BigInt.
- * RFC suggests optional truncating via bits2octets.
- * FIPS 186-4 4.6 suggests the leftmost min(nBitLen, outLen) bits,
- * which matches bits2int. bits2int can produce res>N.
+ * RFC 6979 §2.3.2 says bits2int keeps the leftmost qlen bits and discards the rest.
+ * FIPS 186-4 4.6 gives the same leftmost-bit truncation rule. bits2int can produce res>N.
  */
 const bits2int = (bytes) => {
+    // The 8 KiB cap is only a local DoS guard. Longer ordinary prehashes must still follow
+    // RFC 6979 §2.3.2 truncation instead of being rejected just because blen > qlen.
+    if (bytes.length > 8192)
+        err('input is too large');
     const delta = bytes.length * 8 - 256;
-    if (delta > 1024)
-        err('msg invalid'); // our CUSTOM check, "just-in-case": prohibit long inputs
     const num = bytesToNumBE(bytes);
     return delta > 0 ? num >> big(delta) : num;
 };
@@ -550,16 +593,11 @@ const bits2int_modN = (bytes) => modN(bits2int(abytes(bytes)));
 const SIG_COMPACT = 'compact';
 const SIG_RECOVERED = 'recovered';
 const SIG_DER = 'der';
-const ALL_SIG = [SIG_COMPACT, SIG_RECOVERED, SIG_DER];
-const defaultSignOpts = {
-    lowS: true,
-    prehash: true,
-    format: SIG_COMPACT,
-    extraEntropy: false,
-};
 const _sha = 'SHA-256';
 /**
- * Hash implementations used by the synchronous ECDSA and Schnorr helpers.
+ * Hash implementations used by the synchronous and async ECDSA / Schnorr helpers.
+ * All slots are configurable API surface; wrapper helpers revalidate that SHA-256 and HMAC-SHA256
+ * providers still return exact 32-byte Uint8Array digests.
  * @example
  * Provide sync hash helpers before calling the synchronous signing API.
  * ```ts
@@ -583,11 +621,13 @@ const hashes = {
     sha256Async: async (msg) => u8n(await subtle().digest(_sha, msg)),
     sha256: undefined,
 };
+// prehash=false means the caller already supplies the digest bytes
+// used by sign/verify/recover, and this helper returns the same reference unchanged.
 const prepMsg = (msg, opts, async_) => {
-    abytes(msg, undefined, 'message');
+    const message = abytes(msg, undefined, 'message');
     if (!opts.prehash)
-        return msg;
-    return async_ ? hashes.sha256Async(msg) : callHash('sha256')(msg);
+        return message;
+    return async_ ? gha('sha256Async', message) : gh('sha256', message);
 };
 const NULL = /* @__PURE__ */ u8n(0);
 const byte0 = /* @__PURE__ */ u8of(0x00);
@@ -603,8 +643,9 @@ const hmacDrbg = (seed, pred) => {
         v.fill(1);
         k.fill(0);
     };
-    // h = hmac(K || V || ...)
-    const h = (...b) => callHash('hmacSha256')(k, concatBytes(v, ...b));
+    // h = hmac(K || V || ...). The configured provider is still checked on every call because the
+    // exported slot can be replaced or unset at runtime.
+    const h = (...b) => gh('hmacSha256', k, concatBytes(v, ...b));
     const reseed = (seed = NULL) => {
         // HMAC-DRBG reseed() function. Steps D-G
         k = h(byte0, seed); // k = hmac(k || v || 0x00 || seed)
@@ -619,11 +660,13 @@ const hmacDrbg = (seed, pred) => {
         if (i++ >= _maxDrbgIters)
             err(_drbgErr);
         v = h(); // v = hmac(k || v)
-        return v; // this diverges from noble-curves: we don't allow arbitrary output len!
+        return v; // One block is enough here because secp256k1 qlen and SHA-256 hlen are both 32 bytes.
     };
     reset();
     reseed(seed); // Steps D-G
     let res = undefined; // Step H: grind until k is in [1..n-1]
+    // `pred` receives the live V buffer from gen(); it must treat that input as read-only and
+    // return independent bytes, because reset() scrubs the DRBG state before hmacDrbg returns.
     while (!(res = pred(gen())))
         reseed(); // test predicate until it returns ok
     reset();
@@ -638,8 +681,9 @@ const hmacDrbgAsync = async (seed, pred) => {
         v.fill(1);
         k.fill(0);
     };
-    // h = hmac(K || V || ...)
-    const h = (...b) => hashes.hmacSha256Async(k, concatBytes(v, ...b));
+    // h = hmac(K || V || ...). Async provider lookup still goes through `callHash(...)` because the
+    // exported slot can be replaced or unset at runtime.
+    const h = (...b) => gha('hmacSha256Async', k, concatBytes(v, ...b));
     const reseed = async (seed = NULL) => {
         // HMAC-DRBG reseed() function. Steps D-G
         k = await h(byte0, seed); // k = hmac(K || V || 0x00 || seed)
@@ -654,18 +698,19 @@ const hmacDrbgAsync = async (seed, pred) => {
         if (i++ >= _maxDrbgIters)
             err(_drbgErr);
         v = await h(); // v = hmac(K || V)
-        return v; // this diverges from noble-curves: we don't allow arbitrary output len!
+        return v; // Same one-block shortcut: secp256k1 qlen and SHA-256 hlen are both 32 bytes here.
     };
     reset();
     await reseed(seed); // Steps D-G
     let res = undefined; // Step H: grind until k is in [1..n-1]
+    // Same contract as sync hmacDrbg(): pred sees the live V buffer and must not mutate or return it.
     while (!(res = pred(await gen())))
         await reseed(); // test predicate until it returns ok
     reset();
     return res;
 };
 // RFC6979 signature generation, preparation step.
-// Follows [SEC1](https://secg.org/sec1-v2.pdf) 4.1.2 & RFC6979.
+// Follows [SEC1](https://secg.org/sec1-v2.pdf) 4.1.3 & RFC6979.
 const _sign = (messageHash, secretKey, opts, hmacDrbg) => {
     let { lowS, extraEntropy } = opts; // generates low-s sigs by default
     // RFC6979 3.2: we skip step A
@@ -700,6 +745,10 @@ const _sign = (messageHash, secretKey, opts, hmacDrbg) => {
         const ik = invert(k, N); // k^-1 mod n
         const q = G.multiply(k).toAffine(); // q = k⋅G
         const r = modN(q.x); // r = q.x mod n
+        // RFC 6979 §2.4 step 3 / §3.4 only spell out retry for r = 0.
+        // FIPS 186-5 §6.4.1 step 11 says deterministic ECDSA should fail on r = 0 or s = 0, but
+        // that restart-from-scratch note does not apply here: hmacDrbg() keeps advancing through one
+        // RFC6979 stream until k2sig() accepts a candidate, instead of restarting from the same seed.
         if (r === 0n)
             return;
         const s = modN(ik * modN(m + r * d)); // s = k^-1(m + rd) mod n
@@ -743,12 +792,13 @@ const _verify = (sig, messageHash, publicKey, opts = {}) => {
     }
 };
 const setDefaults = (opts) => {
-    const res = {};
-    Object.keys(defaultSignOpts).forEach((k) => {
-        // @ts-ignore
-        res[k] = opts[k] ?? defaultSignOpts[k];
-    });
-    return res;
+    // Inline defaults keep the same returned keys/values while avoiding the extra defaults object.
+    return {
+        lowS: opts.lowS ?? true,
+        prehash: opts.prehash ?? true,
+        format: opts.format ?? SIG_COMPACT,
+        extraEntropy: opts.extraEntropy ?? false,
+    };
 };
 /**
  * Sign a message using secp256k1. Sync: uses `hashes.sha256` and `hashes.hmacSha256`.
@@ -774,8 +824,9 @@ const setDefaults = (opts) => {
  */
 const sign = (message, secretKey, opts = {}) => {
     opts = setDefaults(opts);
-    message = prepMsg(message, opts, false);
-    return _sign(message, secretKey, opts, hmacDrbg);
+    assertSigFormat(opts.format);
+    const msg = prepMsg(message, opts, false);
+    return _sign(msg, secretKey, opts, hmacDrbg);
 };
 /**
  * Sign a message using secp256k1. Async: uses built-in WebCrypto hashes.
@@ -799,8 +850,9 @@ const sign = (message, secretKey, opts = {}) => {
  */
 const signAsync = async (message, secretKey, opts = {}) => {
     opts = setDefaults(opts);
-    message = await prepMsg(message, opts, true);
-    return _sign(message, secretKey, opts, hmacDrbgAsync);
+    assertSigFormat(opts.format);
+    const msg = (await prepMsg(message, opts, true));
+    return _sign(msg, secretKey, opts, hmacDrbgAsync);
 };
 /**
  * Verify a signature using secp256k1. Sync: uses `hashes.sha256` and `hashes.hmacSha256`.
@@ -808,7 +860,8 @@ const signAsync = async (message, secretKey, opts = {}) => {
  * @param message - message which was signed. Keep in mind `prehash` from opts.
  * @param publicKey - public key that should verify the signature.
  * @param opts - See {@link ECDSAVerifyOpts} for details.
- * @returns `true` when the signature is valid.
+ * @returns `true` when the signature is valid. Unsupported format configuration still
+ * throws instead of returning `false`.
  * @example
  * Verify a signature using secp256k1.
  * ```ts
@@ -831,8 +884,8 @@ const signAsync = async (message, secretKey, opts = {}) => {
  */
 const verify = (signature, message, publicKey, opts = {}) => {
     opts = setDefaults(opts);
-    message = prepMsg(message, opts, false);
-    return _verify(signature, message, publicKey, opts);
+    const msg = prepMsg(message, opts, false);
+    return _verify(signature, msg, publicKey, opts);
 };
 /**
  * Verify a signature using secp256k1. Async: uses built-in WebCrypto hashes.
@@ -840,7 +893,8 @@ const verify = (signature, message, publicKey, opts = {}) => {
  * @param message - message which was signed. Keep in mind `prehash` from opts.
  * @param publicKey - public key that should verify the signature.
  * @param opts - See {@link ECDSAVerifyOpts} for details.
- * @returns `true` when the signature is valid.
+ * @returns `true` when the signature is valid. Unsupported format configuration still
+ * throws instead of returning `false`.
  * @example
  * Verify a signature using secp256k1 with the async WebCrypto path.
  * ```ts
@@ -858,8 +912,8 @@ const verify = (signature, message, publicKey, opts = {}) => {
  */
 const verifyAsync = async (sig, message, publicKey, opts = {}) => {
     opts = setDefaults(opts);
-    message = await prepMsg(message, opts, true);
-    return _verify(sig, message, publicKey, opts);
+    const msg = (await prepMsg(message, opts, true));
+    return _verify(sig, msg, publicKey, opts);
 };
 const _recover = (signature, messageHash) => {
     const sig = Signature.fromBytes(signature, 'recovered');
@@ -867,7 +921,9 @@ const _recover = (signature, messageHash) => {
     // 0 or 1 recovery id determines sign of "y" coordinate.
     // 2 or 3 means q.x was >N.
     assertRecoveryBit(recovery);
-    const h = bits2int_modN(abytes(messageHash, L)); // Truncate hash
+    // SEC 1 recovery derives e through the same truncation path as verification, so prehash:false
+    // must accept long digests here too instead of hard-requiring 32-byte SHA-256 input.
+    const h = bits2int_modN(abytes(messageHash, undefined, 'msgHash')); // Truncate hash
     const radj = recovery === 2 || recovery === 3 ? r + N : r;
     FpIsValidNot0(radj); // ensure q.x is still a field element
     const head = getPrefix(big(recovery)); // head is 0x02 or 0x03
@@ -901,8 +957,8 @@ const _recover = (signature, messageHash) => {
  * ```
  */
 const recoverPublicKey = (signature, message, opts = {}) => {
-    message = prepMsg(message, setDefaults(opts), false);
-    return _recover(signature, message);
+    const msg = prepMsg(message, setDefaults(opts), false);
+    return _recover(signature, msg);
 };
 /**
  * Async ECDSA public key recovery. Requires msg hash and recovery id.
@@ -921,12 +977,14 @@ const recoverPublicKey = (signature, message, opts = {}) => {
  * ```
  */
 const recoverPublicKeyAsync = async (signature, message, opts = {}) => {
-    message = await prepMsg(message, setDefaults(opts), true);
-    return _recover(signature, message);
+    const msg = (await prepMsg(message, setDefaults(opts), true));
+    return _recover(signature, msg);
 };
 /**
  * Elliptic Curve Diffie-Hellman (ECDH) on secp256k1.
- * Result is **NOT hashed**. Use hash or KDF on it if you need.
+ * Result is **NOT hashed** and returns the serialized shared point (compressed by default),
+ * not the SEC 1 x-only primitive `z = x_P`.
+ * secp256k1 has cofactor `h = 1`, so there is no separate cofactor-ECDH distinction here.
  * @param secretKeyA - local 32-byte secret key.
  * @param publicKeyB - peer public key.
  * @param isCompressed - return 33-byte compressed output when `true`.
@@ -943,18 +1001,23 @@ const recoverPublicKeyAsync = async (signature, message, opts = {}) => {
 const getSharedSecret = (secretKeyA, publicKeyB, isCompressed = true) => {
     return Point.fromBytes(publicKeyB).multiply(secretKeyToScalar(secretKeyA)).toBytes(isCompressed);
 };
-// FIPS 186 B.4.1 compliant key generation produces private keys
-// with modulo bias being neglible. takes >N+16 bytes, returns (hash mod n-1)+1
-const randomSecretKey = (seed = randomBytes(lengths.seed)) => {
+// FIPS 186-5 Appendix A.4.1 style key generation reduces a wide random integer mod (n - 1) and adds 1.
+// The 48-byte minimum keeps the secp256k1 bias bound below the appendix's epsilon <= 2^-64 target.
+const randomSecretKey = (seed) => {
+    seed = seed === undefined ? randomBytes(lengths.seed) : seed;
     abytes(seed);
+    // Keep the public range text aligned with the enforced 48-byte FIPS floor.
     if (seed.length < lengths.seed || seed.length > 1024)
-        throw new RangeError('expected 40-1024b');
+        return err('expected 48-1024b', RangeError);
     const num = M(bytesToNumBE(seed), N - 1n);
     return numTo32b(num + 1n);
 };
 const createKeygen = (getPublicKey) => (seed) => {
     const secretKey = randomSecretKey(seed);
-    return { secretKey, publicKey: getPublicKey(secretKey) };
+    return {
+        secretKey,
+        publicKey: getPublicKey(secretKey),
+    };
 };
 /**
  * Generates a secp256k1 keypair.
@@ -981,18 +1044,18 @@ const keygen = /* @__PURE__ */ createKeygen(getPublicKey);
  * const hex = etc.bytesToHex(new Uint8Array([1, 2, 3]));
  * ```
  */
-const etc = {
-    hexToBytes: hexToBytes,
-    bytesToHex: bytesToHex,
-    concatBytes: concatBytes,
+const etc = /* @__PURE__ */ Object.freeze({
+    hexToBytes,
+    bytesToHex,
+    concatBytes,
     bytesToNumberBE: bytesToNumBE,
     numberToBytesBE: numTo32b,
     mod: M,
-    invert: invert, // math utilities
-    randomBytes: randomBytes,
+    invert: invert, // math utilities; keep public alias type aligned with runtime
+    randomBytes,
     secretKeyToScalar: secretKeyToScalar,
     abytes: abytes,
-};
+});
 /**
  * Curve-specific key utilities.
  * @example
@@ -1003,29 +1066,28 @@ const etc = {
  * const publicKey = secp.getPublicKey(secretKey);
  * ```
  */
-const utils = {
+const utils = /* @__PURE__ */ Object.freeze({
     isValidSecretKey: isValidSecretKey,
     isValidPublicKey: isValidPublicKey,
-    randomSecretKey: randomSecretKey,
-};
+    randomSecretKey: randomSecretKey, // preserve the optional seeded call
+});
 // Schnorr signatures are superior to ECDSA from above. Below is Schnorr-specific BIP0340 code.
 // https://github.com/bitcoin/bips/blob/master/bip-0340.mediawiki
+// Internal BIP340 tag names are ASCII-only here, so charCodeAt() is enough; this is not a general UTF-8 encoder.
 const getTag = (tag) => Uint8Array.from('BIP0340/' + tag, (c) => c.charCodeAt(0));
 const T_AUX = 'aux';
 const T_NONCE = 'nonce';
 const T_CHALLENGE = 'challenge';
+// Both SHA-256 provider slots are configurable, so tag hashing still goes through the checked
+// wrappers even though the built-in defaults are deterministic and the tag bytes are ASCII-only.
 const taggedHash = (tag, ...messages) => {
-    const fn = callHash('sha256');
-    const tagH = fn(getTag(tag));
-    return fn(concatBytes(tagH, tagH, ...messages));
+    const tagH = gh('sha256', getTag(tag));
+    return gh('sha256', concatBytes(tagH, tagH, ...messages));
 };
-const taggedHashAsync = async (tag, ...messages) => {
-    const fn = hashes.sha256Async;
-    const tagH = await fn(getTag(tag));
-    return await fn(concatBytes(tagH, tagH, ...messages));
-};
-// ECDSA compact points are 33-byte. Schnorr is 32: we strip first byte 0x02 or 0x03
-// Calculate point, scalar and bytes
+// Async twin of taggedHash with the same checked provider boundary.
+const taggedHashAsync = (tag, ...messages) => gha('sha256Async', getTag(tag)).then((tagH) => gha('sha256Async', concatBytes(tagH, tagH, ...messages)));
+// BIP340 PubKey(sk) = bytes(d'⋅G), where bytes(P) is bytes(x(P)); signing also normalizes
+// d to the equivalent scalar whose point has even y so the x-only public key stays canonical.
 const extpubSchnorr = (priv) => {
     const d_ = secretKeyToScalar(priv);
     const p = G.multiply(d_); // P = d'⋅G; 0 < d' < n check is done inside
@@ -1061,7 +1123,8 @@ const createSigSchnorr = (k, px, e, d) => {
 const E_INVSIG = 'invalid signature produced';
 /**
  * Creates Schnorr signature as per BIP340. Verifies itself before returning anything.
- * auxRand is optional and is not the sole source of k generation: bad CSPRNG won't be dangerous.
+ * auxRand is optional and defaults to fresh 32-byte randomness; it is not the sole source of
+ * k generation, so bad CSPRNG won't be the only entropy source.
  */
 const signSchnorr = (message, secretKey, auxRand = randomBytes(L)) => {
     const { m, px, d, a } = prepSigSchnorr(message, secretKey, auxRand);
@@ -1106,16 +1169,16 @@ const _verifSchnorr = (signature, message, publicKey, challengeFn) => {
         // lift_x from BIP340. Convert 32-byte x coordinate to elliptic curve point.
         // Fail if x ≥ p. Let c = x³ + 7 mod p.
         const x = bytesToNumBE(pub);
-        const y = lift_x(x); // Let y = c^(p+1)/4 mod p.
-        const y_ = isEven(y) ? y : M(-y);
-        // Return the unique point P such that x(P) = x and
-        // y(P) = y if y mod 2 = 0 or y(P) = p-y otherwise.
-        const P_ = new Point(x, y_, 1n).assertValidity();
+        const y = lift_x(x); // lift_x already returns the unique even root required by BIP340.
+        const P_ = new Point(x, y, 1n).assertValidity();
         const px = numTo32b(P_.toAffine().x);
         // P = lift_x(int(pk)); fail if that fails
         const r = sliceBytesNumBE(sig, 0, L); // Let r = int(sig[0:32]); fail if r ≥ p.
         arange(r, 1n, P);
         const s = sliceBytesNumBE(sig, L, L2); // Let s = int(sig[32:64]); fail if s ≥ n.
+        // Stricter than BIP-340/libsecp256k1, which only reject s >= n. Honest signing reaches
+        // s = 0 only with negligible probability (k + e*d ≡ 0 mod n), so treat zero-s inputs as
+        // crafted edge cases and fail closed instead of carrying that extra verification surface.
         arange(s, 1n, N);
         const i = concatBytes(numTo32b(r), px, msg);
         // int(challenge(bytes(r)||bytes(P)||m))%n
@@ -1130,11 +1193,13 @@ const _verifSchnorr = (signature, message, publicKey, challengeFn) => {
         return false;
     }
 };
-/**
- * Verifies Schnorr signature.
- * Will swallow errors & return false except for initial type validation of arguments.
- */
+/** Verifies Schnorr signature. Sync wrapper returns false for post-validation failures
+ * after the initial byte checks. */
 const verifySchnorr = (s, m, p) => _verifSchnorr(s, m, p, challenge);
+/** Async Schnorr verification. Curve/encoding failures after the initial byte checks still
+ * become false, but async backend failures reject the promise. Missing crypto.subtle is a
+ * runtime/backend error, not an "invalid signature" result, so we surface it instead of
+ * turning it into false. */
 const verifySchnorrAsync = async (s, m, p) => _verifSchnorr(s, m, p, challengeAsync);
 /**
  * BIP340 Schnorr helpers over secp256k1.
@@ -1151,14 +1216,14 @@ const verifySchnorrAsync = async (s, m, p) => _verifSchnorr(s, m, p, challengeAs
  * const isValid = secp.schnorr.verify(sig, message, publicKey);
  * ```
  */
-const schnorr = {
+const schnorr = /* @__PURE__ */ Object.freeze({
     keygen: keygenSchnorr,
     getPublicKey: pubSchnorr,
     sign: signSchnorr,
     verify: verifySchnorr,
     signAsync: signSchnorrAsync,
     verifyAsync: verifySchnorrAsync,
-};
+});
 // ## Precomputes
 // --------------
 const W = 8; // W is window size
@@ -1181,7 +1246,7 @@ const precompute = () => {
     return points;
 };
 let Gpows = undefined; // precomputes for base point G
-// const-time negate
+// Branch-shaped negate helper for wNAF; not a hard constant-time primitive in JavaScript.
 const ctneg = (cnd, p) => {
     const n = p.negate();
     return cnd ? n : p;
@@ -1232,7 +1297,7 @@ const wNAF = (n) => {
     }
     if (n !== 0n)
         err('invalid wnaf');
-    return { p, f }; // return both real and fake points for JIT
+    return { p, f }; // return both real and fake points for JIT/leakage-shape symmetry
 };
 // !! Remove the export below to easily use in REPL / browser console
 export { etc, getPublicKey, getSharedSecret, hash, hashes, keygen, Point, recoverPublicKey, recoverPublicKeyAsync, schnorr, sign, signAsync, Signature, utils, verify, verifyAsync };

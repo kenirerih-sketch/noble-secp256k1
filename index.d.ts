@@ -1,5 +1,45 @@
 /** Alias to Uint8Array. */
 export type Bytes = Uint8Array;
+/**
+ * Bytes API type helpers for old + new TypeScript.
+ *
+ * TS 5.6 has `Uint8Array`, while TS 5.9+ made it generic `Uint8Array<ArrayBuffer>`.
+ * We can't use specific return type, because TS 5.6 will error.
+ * We can't use generic return type, because most TS 5.9 software will expect specific type.
+ *
+ * Maps typed-array input leaves to broad forms.
+ * These are compatibility adapters, not ownership guarantees.
+ *
+ * - `TArg` keeps byte inputs broad.
+ * - `TRet` marks byte outputs for TS 5.6 and TS 5.9+ compatibility.
+ */
+export type TypedArg<T> = T extends BigInt64Array ? BigInt64Array : T extends BigUint64Array ? BigUint64Array : T extends Float32Array ? Float32Array : T extends Float64Array ? Float64Array : T extends Int16Array ? Int16Array : T extends Int32Array ? Int32Array : T extends Int8Array ? Int8Array : T extends Uint16Array ? Uint16Array : T extends Uint32Array ? Uint32Array : T extends Uint8ClampedArray ? Uint8ClampedArray : T extends Uint8Array ? Uint8Array : never;
+/** Maps typed-array output leaves to narrow TS-compatible forms. */
+export type TypedRet<T> = T extends BigInt64Array ? ReturnType<typeof BigInt64Array.of> : T extends BigUint64Array ? ReturnType<typeof BigUint64Array.of> : T extends Float32Array ? ReturnType<typeof Float32Array.of> : T extends Float64Array ? ReturnType<typeof Float64Array.of> : T extends Int16Array ? ReturnType<typeof Int16Array.of> : T extends Int32Array ? ReturnType<typeof Int32Array.of> : T extends Int8Array ? ReturnType<typeof Int8Array.of> : T extends Uint16Array ? ReturnType<typeof Uint16Array.of> : T extends Uint32Array ? ReturnType<typeof Uint32Array.of> : T extends Uint8ClampedArray ? ReturnType<typeof Uint8ClampedArray.of> : T extends Uint8Array ? ReturnType<typeof Uint8Array.of> : never;
+/** Recursively adapts byte-carrying API input types. See {@link TypedArg}. */
+export type TArg<T> = T | ([TypedArg<T>] extends [never] ? T extends (...args: infer A) => infer R ? ((...args: {
+    [K in keyof A]: TRet<A[K]>;
+}) => TArg<R>) & {
+    [K in keyof T]: T[K] extends (...args: any) => any ? T[K] : TArg<T[K]>;
+} : T extends [infer A, ...infer R] ? [TArg<A>, ...{
+    [K in keyof R]: TArg<R[K]>;
+}] : T extends readonly [infer A, ...infer R] ? readonly [TArg<A>, ...{
+    [K in keyof R]: TArg<R[K]>;
+}] : T extends (infer A)[] ? TArg<A>[] : T extends readonly (infer A)[] ? readonly TArg<A>[] : T extends Promise<infer A> ? Promise<TArg<A>> : T extends object ? {
+    [K in keyof T]: TArg<T[K]>;
+} : T : TypedArg<T>);
+/** Recursively adapts byte-carrying API output types. See {@link TypedArg}. */
+export type TRet<T> = T extends unknown ? T & ([TypedRet<T>] extends [never] ? T extends (...args: infer A) => infer R ? ((...args: {
+    [K in keyof A]: TArg<A[K]>;
+}) => TRet<R>) & {
+    [K in keyof T]: T[K] extends (...args: any) => any ? T[K] : TRet<T[K]>;
+} : T extends [infer A, ...infer R] ? [TRet<A>, ...{
+    [K in keyof R]: TRet<R[K]>;
+}] : T extends readonly [infer A, ...infer R] ? readonly [TRet<A>, ...{
+    [K in keyof R]: TRet<R[K]>;
+}] : T extends (infer A)[] ? TRet<A>[] : T extends readonly (infer A)[] ? readonly TRet<A>[] : T extends Promise<infer A> ? Promise<TRet<A>> : T extends object ? {
+    [K in keyof T]: TRet<T[K]>;
+} : T : TypedRet<T>) : never;
 /** Signature instance, which allows recovering pubkey from it. */
 export type RecoveredSignature = Signature & {
     recovery: number;
@@ -14,8 +54,10 @@ export type WeierstrassOpts<T> = Readonly<{
     Gx: T;
     Gy: T;
 }>;
-/** Asserts something is Uint8Array. */
-declare const abytes: (value: Bytes, length?: number, title?: string) => Bytes;
+/** Asserts something is Bytes. */
+declare const abytes: (value: TArg<Bytes>, length?: number, title?: string) => TRet<Bytes>;
+/** Modular inversion using eucledian GCD (non-CT). No negative exponent for now. */
+declare const invert: (num: bigint, md: bigint) => bigint;
 /**
  * SHA-256 helper used by the synchronous API.
  * @param msg - message bytes to hash
@@ -29,7 +71,7 @@ declare const abytes: (value: Bytes, length?: number, title?: string) => Bytes;
  * const digest = secp.hash(new Uint8Array([1, 2, 3]));
  * ```
  */
-declare const hash: (msg: Bytes) => Bytes;
+declare const hash: (msg: TArg<Bytes>) => TRet<Bytes>;
 /** Point in 2d xy affine coordinates. */
 export type AffinePoint = {
     /** Affine x coordinate. */
@@ -37,6 +79,13 @@ export type AffinePoint = {
     /** Affine y coordinate. */
     y: bigint;
 };
+export declare const __TEST: TRet<{
+    lift_x: (x: bigint) => Point;
+    extractK: (rand: TArg<Bytes>) => TRet<{
+        rx: Bytes;
+        k: bigint;
+    }>;
+}>;
 /**
  * Point in 3d xyz projective coordinates. 3d takes less inversions than 2d.
  * @param X - X coordinate.
@@ -56,11 +105,14 @@ declare class Point {
     readonly Y: bigint;
     readonly Z: bigint;
     constructor(X: bigint, Y: bigint, Z: bigint);
+    /** Returns the shared curve metadata object by reference.
+     * It is readonly only at type level, and mutating it won't retarget arithmetic,
+     * which already uses module-load snapshots. */
     static CURVE(): WeierstrassOpts<bigint>;
     /** Create 3d xyz point from 2d xy. (0, 0) => (0, 1, 0), not (0, 0, 1) */
     static fromAffine(ap: AffinePoint): Point;
     /** Convert Uint8Array or hex string to Point. */
-    static fromBytes(bytes: Bytes): Point;
+    static fromBytes(bytes: TArg<Bytes>): Point;
     static fromHex(hex: string): Point;
     get x(): bigint;
     get y(): bigint;
@@ -81,7 +133,7 @@ declare class Point {
     /**
      * Point-by-scalar multiplication. Scalar must be in range 1 <= n < CURVE.n.
      * Uses {@link wNAF} for base point.
-     * Uses fake point to mitigate side-channel leakage.
+     * Uses fake point to mitigate leakage shape in JS, not as a hard constant-time guarantee.
      * @param n scalar by which point is multiplied
      * @param safe safe mode guards against timing attacks; unsafe mode is faster
      */
@@ -92,16 +144,16 @@ declare class Point {
     /** Checks if the point is valid and on-curve. */
     assertValidity(): Point;
     /** Converts point to 33/65-byte Uint8Array. */
-    toBytes(isCompressed?: boolean): Bytes;
+    toBytes(isCompressed?: boolean): TRet<Bytes>;
     toHex(isCompressed?: boolean): string;
 }
-/** Normalize private key to scalar (bigint). Verifies scalar is in range 1<s<N */
-declare const secretKeyToScalar: (secretKey: Bytes) => bigint;
+/** Normalize private key to scalar (bigint). Verifies scalar is in range 1 <= d < N. */
+declare const secretKeyToScalar: (secretKey: TArg<Bytes>) => bigint;
 /**
- * Creates 33/65-byte public key from 32-byte private key.
+ * Creates a SEC 1 public key from a 32-byte private key.
  * @param privKey - 32-byte secret key.
- * @param isCompressed - return 33-byte compressed key when `true`.
- * @returns serialized secp256k1 public key.
+ * @param isCompressed - return 33-byte compressed SEC 1 encoding when `true`, otherwise 65-byte uncompressed.
+ * @returns serialized secp256k1 public key in SEC 1 encoding.
  * @example
  * Derive the serialized public key for a secp256k1 secret key.
  * ```ts
@@ -110,9 +162,9 @@ declare const secretKeyToScalar: (secretKey: Bytes) => bigint;
  * const publicKey = secp.getPublicKey(secretKey);
  * ```
  */
-declare const getPublicKey: (privKey: Bytes, isCompressed?: boolean) => Bytes;
-declare const isValidSecretKey: (secretKey: Bytes) => boolean;
-declare const isValidPublicKey: (publicKey: Bytes, isCompressed?: boolean) => boolean;
+declare const getPublicKey: (privKey: TArg<Bytes>, isCompressed?: boolean) => TRet<Bytes>;
+declare const isValidSecretKey: (secretKey: TArg<Bytes>) => boolean;
+declare const isValidPublicKey: (publicKey: TArg<Bytes>, isCompressed?: boolean) => boolean;
 /**
  * ECDSA Signature class. Supports only compact 64-byte representation, not DER.
  * @param r - signature `r` scalar.
@@ -130,10 +182,10 @@ declare class Signature {
     readonly s: bigint;
     readonly recovery?: number;
     constructor(r: bigint, s: bigint, recovery?: number);
-    static fromBytes(b: Bytes, format?: ECDSASignatureFormat): Signature;
+    static fromBytes(b: TArg<Bytes>, format?: ECDSASignatureFormat): Signature;
     addRecoveryBit(bit: number): RecoveredSignature;
     hasHighS(): boolean;
-    toBytes(format?: ECDSASignatureFormat): Bytes;
+    toBytes(format?: ECDSASignatureFormat): TRet<Bytes>;
 }
 /**
  * Option to enable hedged signatures with improved security.
@@ -155,7 +207,7 @@ export type ECDSAExtraEntropy = boolean | Bytes;
 /**
  * - `compact` is the default format
  * - `recovered` is the same as compact, but with an extra byte indicating recovery byte
- * - `der` is not supported; and provided for consistency.
+ * - `der` is not supported; it is included only so unsupported requests can be rejected consistently.
  *   Switch to noble-curves if you need der.
  */
 export type ECDSASignatureFormat = 'compact' | 'recovered' | 'der';
@@ -170,7 +222,7 @@ export type ECDSARecoverOpts = {
 /**
  * - `prehash`: (default: true) indicates whether to do sha256(message).
  *   When a custom hash is used, it must be set to `false`.
- * - `lowS`: (default: true) prohibits signatures which have (`sig.s >= CURVE.n / 2n`).
+ * - `lowS`: (default: true) prohibits signatures in the strict upper half (`sig.s > floor(CURVE.n / 2n)`).
  *   Compatible with BTC/ETH. Setting `lowS: false` allows to create malleable signatures,
  *   which is default openssl behavior.
  *   Non-malleable signatures can still be successfully verified in openssl.
@@ -187,7 +239,7 @@ export type ECDSAVerifyOpts = {
 /**
  * - `prehash`: (default: true) indicates whether to do sha256(message).
  *   When a custom hash is used, it must be set to `false`.
- * - `lowS`: (default: true) prohibits signatures which have (`sig.s >= CURVE.n / 2n`).
+ * - `lowS`: (default: true) prohibits signatures in the strict upper half (`sig.s > floor(CURVE.n / 2n)`).
  *   Compatible with BTC/ETH. Setting `lowS: false` allows to create malleable signatures,
  *   which is default openssl behavior.
  *   Non-malleable signatures can still be successfully verified in openssl.
@@ -205,7 +257,9 @@ export type ECDSASignOpts = {
     extraEntropy?: ECDSAExtraEntropy;
 };
 /**
- * Hash implementations used by the synchronous ECDSA and Schnorr helpers.
+ * Hash implementations used by the synchronous and async ECDSA / Schnorr helpers.
+ * All slots are configurable API surface; wrapper helpers revalidate that SHA-256 and HMAC-SHA256
+ * providers still return exact 32-byte Uint8Array digests.
  * @example
  * Provide sync hash helpers before calling the synchronous signing API.
  * ```ts
@@ -219,10 +273,10 @@ export type ECDSASignOpts = {
  * ```
  */
 declare const hashes: {
-    hmacSha256Async: (key: Bytes, message: Bytes) => Promise<Bytes>;
-    hmacSha256: undefined | ((key: Bytes, message: Bytes) => Bytes);
-    sha256Async: (msg: Bytes) => Promise<Bytes>;
-    sha256: undefined | ((message: Bytes) => Bytes);
+    hmacSha256Async: (key: TArg<Bytes>, message: TArg<Bytes>) => Promise<TRet<Bytes>>;
+    hmacSha256: undefined | ((key: TArg<Bytes>, message: TArg<Bytes>) => TRet<Bytes>);
+    sha256Async: (msg: TArg<Bytes>) => Promise<TRet<Bytes>>;
+    sha256: undefined | ((message: TArg<Bytes>) => TRet<Bytes>);
 };
 /**
  * Sign a message using secp256k1. Sync: uses `hashes.sha256` and `hashes.hmacSha256`.
@@ -246,7 +300,7 @@ declare const hashes: {
  * secp.sign(msg, secretKey, { format: 'recovered' });
  * ```
  */
-declare const sign: (message: Bytes, secretKey: Bytes, opts?: ECDSASignOpts) => Bytes;
+declare const sign: (message: TArg<Bytes>, secretKey: TArg<Bytes>, opts?: TArg<ECDSASignOpts>) => TRet<Bytes>;
 /**
  * Sign a message using secp256k1. Async: uses built-in WebCrypto hashes.
  * Prehashes message with sha256, disable using `prehash: false`.
@@ -267,14 +321,15 @@ declare const sign: (message: Bytes, secretKey: Bytes, opts?: ECDSASignOpts) => 
  * await secp.signAsync(msg, secretKey, { format: 'recovered' });
  * ```
  */
-declare const signAsync: (message: Bytes, secretKey: Bytes, opts?: ECDSASignOpts) => Promise<Bytes>;
+declare const signAsync: (message: TArg<Bytes>, secretKey: TArg<Bytes>, opts?: TArg<ECDSASignOpts>) => Promise<TRet<Bytes>>;
 /**
  * Verify a signature using secp256k1. Sync: uses `hashes.sha256` and `hashes.hmacSha256`.
  * @param signature - default is 64-byte `compact` format; also see {@link ECDSASignatureFormat}.
  * @param message - message which was signed. Keep in mind `prehash` from opts.
  * @param publicKey - public key that should verify the signature.
  * @param opts - See {@link ECDSAVerifyOpts} for details.
- * @returns `true` when the signature is valid.
+ * @returns `true` when the signature is valid. Unsupported format configuration still
+ * throws instead of returning `false`.
  * @example
  * Verify a signature using secp256k1.
  * ```ts
@@ -295,14 +350,15 @@ declare const signAsync: (message: Bytes, secretKey: Bytes, opts?: ECDSASignOpts
  * secp.verify(sigr, msg, publicKey, { format: 'recovered' });
  * ```
  */
-declare const verify: (signature: Bytes, message: Bytes, publicKey: Bytes, opts?: ECDSAVerifyOpts) => boolean;
+declare const verify: (signature: TArg<Bytes>, message: TArg<Bytes>, publicKey: TArg<Bytes>, opts?: TArg<ECDSAVerifyOpts>) => boolean;
 /**
  * Verify a signature using secp256k1. Async: uses built-in WebCrypto hashes.
  * @param sig - default is 64-byte `compact` format; also see {@link ECDSASignatureFormat}.
  * @param message - message which was signed. Keep in mind `prehash` from opts.
  * @param publicKey - public key that should verify the signature.
  * @param opts - See {@link ECDSAVerifyOpts} for details.
- * @returns `true` when the signature is valid.
+ * @returns `true` when the signature is valid. Unsupported format configuration still
+ * throws instead of returning `false`.
  * @example
  * Verify a signature using secp256k1 with the async WebCrypto path.
  * ```ts
@@ -318,7 +374,7 @@ declare const verify: (signature: Bytes, message: Bytes, publicKey: Bytes, opts?
  * await secp.verifyAsync(sig, keccak_256(msg), publicKey, { prehash: false });
  * ```
  */
-declare const verifyAsync: (sig: Bytes, message: Bytes, publicKey: Bytes, opts?: ECDSAVerifyOpts) => Promise<boolean>;
+declare const verifyAsync: (sig: TArg<Bytes>, message: TArg<Bytes>, publicKey: TArg<Bytes>, opts?: TArg<ECDSAVerifyOpts>) => Promise<boolean>;
 /**
  * ECDSA public key recovery. Requires msg hash and recovery id.
  * Follows {@link https://secg.org/sec1-v2.pdf | SEC1} 4.1.6.
@@ -340,7 +396,7 @@ declare const verifyAsync: (sig: Bytes, message: Bytes, publicKey: Bytes, opts?:
  * secp.recoverPublicKey(sig, message);
  * ```
  */
-declare const recoverPublicKey: (signature: Bytes, message: Bytes, opts?: ECDSARecoverOpts) => Bytes;
+declare const recoverPublicKey: (signature: TArg<Bytes>, message: TArg<Bytes>, opts?: TArg<ECDSARecoverOpts>) => TRet<Bytes>;
 /**
  * Async ECDSA public key recovery. Requires msg hash and recovery id.
  * @param signature - recovered-format signature from `signAsync(..., { format: 'recovered' })`.
@@ -357,10 +413,12 @@ declare const recoverPublicKey: (signature: Bytes, message: Bytes, opts?: ECDSAR
  * await secp.recoverPublicKeyAsync(sig, message);
  * ```
  */
-declare const recoverPublicKeyAsync: (signature: Bytes, message: Bytes, opts?: ECDSARecoverOpts) => Promise<Bytes>;
+declare const recoverPublicKeyAsync: (signature: TArg<Bytes>, message: TArg<Bytes>, opts?: TArg<ECDSARecoverOpts>) => Promise<TRet<Bytes>>;
 /**
  * Elliptic Curve Diffie-Hellman (ECDH) on secp256k1.
- * Result is **NOT hashed**. Use hash or KDF on it if you need.
+ * Result is **NOT hashed** and returns the serialized shared point (compressed by default),
+ * not the SEC 1 x-only primitive `z = x_P`.
+ * secp256k1 has cofactor `h = 1`, so there is no separate cofactor-ECDH distinction here.
  * @param secretKeyA - local 32-byte secret key.
  * @param publicKeyB - peer public key.
  * @param isCompressed - return 33-byte compressed output when `true`.
@@ -374,12 +432,13 @@ declare const recoverPublicKeyAsync: (signature: Bytes, message: Bytes, opts?: E
  * const shared = secp.getSharedSecret(alice, secp.getPublicKey(bob));
  * ```
  */
-declare const getSharedSecret: (secretKeyA: Bytes, publicKeyB: Bytes, isCompressed?: boolean) => Bytes;
+declare const getSharedSecret: (secretKeyA: TArg<Bytes>, publicKeyB: TArg<Bytes>, isCompressed?: boolean) => TRet<Bytes>;
+declare const randomSecretKey: (seed?: TArg<Bytes>) => TRet<Bytes>;
 type KeysSecPub = {
     secretKey: Bytes;
     publicKey: Bytes;
 };
-type KeygenFn = (seed?: Bytes) => KeysSecPub;
+type KeygenFn = (seed?: TArg<Bytes>) => TRet<KeysSecPub>;
 /**
  * Generates a secp256k1 keypair.
  * @param seed - optional entropy seed.
@@ -406,14 +465,14 @@ declare const keygen: KeygenFn;
  * ```
  */
 declare const etc: {
-    hexToBytes: (hex: string) => Bytes;
-    bytesToHex: (bytes: Bytes) => string;
-    concatBytes: (...arrs: Bytes[]) => Bytes;
-    bytesToNumberBE: (a: Bytes) => bigint;
-    numberToBytesBE: (n: bigint) => Bytes;
+    hexToBytes: (hex: string) => TRet<Bytes>;
+    bytesToHex: (bytes: TArg<Bytes>) => string;
+    concatBytes: (...arrs: TArg<Bytes[]>) => TRet<Bytes>;
+    bytesToNumberBE: (a: TArg<Bytes>) => bigint;
+    numberToBytesBE: (n: bigint) => TRet<Bytes>;
     mod: (a: bigint, md?: bigint) => bigint;
-    invert: (num: bigint, md?: bigint) => bigint;
-    randomBytes: (len?: number) => Bytes;
+    invert: typeof invert;
+    randomBytes: (len?: number) => TRet<Bytes>;
     secretKeyToScalar: typeof secretKeyToScalar;
     abytes: typeof abytes;
 };
@@ -430,23 +489,26 @@ declare const etc: {
 declare const utils: {
     isValidSecretKey: typeof isValidSecretKey;
     isValidPublicKey: typeof isValidPublicKey;
-    randomSecretKey: () => Bytes;
+    randomSecretKey: typeof randomSecretKey;
 };
 /** Schnorr public key is just `x` coordinate of Point as per BIP340. */
-declare const pubSchnorr: (secretKey: Bytes) => Bytes;
+declare const pubSchnorr: (secretKey: TArg<Bytes>) => TRet<Bytes>;
 declare const keygenSchnorr: KeygenFn;
 /**
  * Creates Schnorr signature as per BIP340. Verifies itself before returning anything.
- * auxRand is optional and is not the sole source of k generation: bad CSPRNG won't be dangerous.
+ * auxRand is optional and defaults to fresh 32-byte randomness; it is not the sole source of
+ * k generation, so bad CSPRNG won't be the only entropy source.
  */
-declare const signSchnorr: (message: Bytes, secretKey: Bytes, auxRand?: Bytes) => Bytes;
-declare const signSchnorrAsync: (message: Bytes, secretKey: Bytes, auxRand?: Bytes) => Promise<Bytes>;
-/**
- * Verifies Schnorr signature.
- * Will swallow errors & return false except for initial type validation of arguments.
- */
-declare const verifySchnorr: (s: Bytes, m: Bytes, p: Bytes) => boolean;
-declare const verifySchnorrAsync: (s: Bytes, m: Bytes, p: Bytes) => Promise<boolean>;
+declare const signSchnorr: (message: TArg<Bytes>, secretKey: TArg<Bytes>, auxRand?: TArg<Bytes>) => TRet<Bytes>;
+declare const signSchnorrAsync: (message: TArg<Bytes>, secretKey: TArg<Bytes>, auxRand?: TArg<Bytes>) => Promise<TRet<Bytes>>;
+/** Verifies Schnorr signature. Sync wrapper returns false for post-validation failures
+ * after the initial byte checks. */
+declare const verifySchnorr: (s: TArg<Bytes>, m: TArg<Bytes>, p: TArg<Bytes>) => boolean;
+/** Async Schnorr verification. Curve/encoding failures after the initial byte checks still
+ * become false, but async backend failures reject the promise. Missing crypto.subtle is a
+ * runtime/backend error, not an "invalid signature" result, so we surface it instead of
+ * turning it into false. */
+declare const verifySchnorrAsync: (s: TArg<Bytes>, m: TArg<Bytes>, p: TArg<Bytes>) => Promise<boolean>;
 /**
  * BIP340 Schnorr helpers over secp256k1.
  * @example
