@@ -369,16 +369,16 @@ NIST prohibits classical cryptography (RSA, DSA, ECDSA, ECDH) [after 2035](https
 Benchmarks measured with Apple M4. [noble-curves](https://github.com/paulmillr/noble-curves) enable faster performance.
 
 ```
-keygen x 7,643 ops/sec @ 130μs/op
-sign x 7,620 ops/sec @ 131μs/op
-verify x 823 ops/sec @ 1ms/op
-getSharedSecret x 707 ops/sec @ 1ms/op
-recoverPublicKey x 790 ops/sec @ 1ms/op
+keygen x 7,267 ops/sec @ 137μs/op
+sign x 6,888 ops/sec @ 145μs/op
+verify x 788 ops/sec @ 1ms/op
+getSharedSecret x 654 ops/sec @ 1ms/op
+recoverPublicKey x 766 ops/sec @ 1ms/op
 
-signAsync x 4,874 ops/sec @ 205μs/op
-verifyAsync x 811 ops/sec @ 1ms/op
+signAsync x 4,353 ops/sec @ 229μs/op
+verifyAsync x 773 ops/sec @ 1ms/op
 
-Point.fromBytes x 13,656 ops/sec @ 73μs/op
+Point.fromBytes x 13,322 ops/sec @ 75μs/op
 ```
 
 ## Upgrading

@@ -532,4 +532,4 @@ declare const schnorr: {
     signAsync: typeof signSchnorrAsync;
     verifyAsync: typeof verifySchnorrAsync;
 };
-export { etc, getPublicKey, getSharedSecret, hash, hashes, keygen, Point, recoverPublicKey, recoverPublicKeyAsync, schnorr, sign, signAsync, Signature, utils, verify, verifyAsync };
+export { etc, getPublicKey, getSharedSecret, hash, hashes, keygen, Point, recoverPublicKey, recoverPublicKeyAsync, schnorr, sign, signAsync, Signature, utils, verify, verifyAsync, };

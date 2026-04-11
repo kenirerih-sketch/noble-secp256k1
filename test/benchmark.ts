@@ -16,7 +16,7 @@ import * as curve from '../index.ts';
       sig = curve.sign(msg, keys.secretKey);
       sigr = curve.sign(msg, keys.secretKey, { format: 'recovered' });
     },
-    1
+    { mode: 'runOnce' }
   );
   await mark('keygen', () => curve.keygen());
   await mark('sign', () => curve.sign(msg, keys.secretKey));
