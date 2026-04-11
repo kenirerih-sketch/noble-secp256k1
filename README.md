@@ -362,25 +362,6 @@ Consider switching to newer / hybrid algorithms, such as SPHINCS+. They are avai
 
 NIST prohibits classical cryptography (RSA, DSA, ECDSA, ECDH) [after 2035](https://nvlpubs.nist.gov/nistpubs/ir/2024/NIST.IR.8547.ipd.pdf). Australian ASD prohibits it [after 2030](https://www.cyber.gov.au/resources-business-and-government/essential-cyber-security/ism/cyber-security-guidelines/guidelines-cryptography).
 
-## Speed
-
-    npm run bench
-
-Benchmarks measured with Apple M4. [noble-curves](https://github.com/paulmillr/noble-curves) enable faster performance.
-
-```
-keygen x 7,267 ops/sec @ 137μs/op
-sign x 6,888 ops/sec @ 145μs/op
-verify x 788 ops/sec @ 1ms/op
-getSharedSecret x 654 ops/sec @ 1ms/op
-recoverPublicKey x 766 ops/sec @ 1ms/op
-
-signAsync x 4,353 ops/sec @ 229μs/op
-verifyAsync x 773 ops/sec @ 1ms/op
-
-Point.fromBytes x 13,322 ops/sec @ 75μs/op
-```
-
 ## Upgrading
 
 ### v2 to v3
@@ -464,6 +445,25 @@ The goal of v2 is to provide minimum possible JS library which is safe and fast.
 See [paulmillr.com/noble](https://paulmillr.com/noble/)
 for useful resources, articles, documentation and demos
 related to the library.
+
+## Speed
+
+    npm run bench
+
+Benchmarks measured with Apple M4. [noble-curves](https://github.com/paulmillr/noble-curves) enable faster performance.
+
+```
+keygen x 7,267 ops/sec @ 137μs/op
+sign x 6,888 ops/sec @ 145μs/op
+verify x 788 ops/sec @ 1ms/op
+getSharedSecret x 654 ops/sec @ 1ms/op
+recoverPublicKey x 766 ops/sec @ 1ms/op
+
+signAsync x 4,353 ops/sec @ 229μs/op
+verifyAsync x 773 ops/sec @ 1ms/op
+
+Point.fromBytes x 13,322 ops/sec @ 75μs/op
+```
 
 ## License
 
